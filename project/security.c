@@ -132,7 +132,10 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         
         // Add certificate directly from the loaded file
         // The certificate should already include DNS_NAME, PUBLIC_KEY, and SIGNATURE
+        //fprintf(stderr, "Certificate: ");
+        //print_tlv_bytes(certificate, cert_size);
         tlv* certTLV = deserialize_tlv(certificate, cert_size);
+
         if (!certTLV) {
             fprintf(stderr, "Failed to deserialize certificate\n");
             free_tlv(serverHello);
@@ -142,11 +145,11 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         
         // Add the ephemeral public key as a separate TLV after the certificate
         tlv* pubKeyTLV = create_tlv(PUBLIC_KEY);
-        add_val(pubKeyTLV, server_ephemeral_public_key, server_ephemeral_public_key_len);
+        add_val(pubKeyTLV, public_key, pub_key_size);
         add_tlv(serverHello, pubKeyTLV);
         
         // Prepare data for the handshake signature
-        size_t data_size = received_client_hello_len + NONCE_SIZE + cert_size + server_ephemeral_public_key_len;
+        size_t data_size = received_client_hello_len + NONCE_SIZE + cert_size + pub_key_size;
         uint8_t* data_to_sign = malloc(data_size);
         size_t offset = 0;
         memcpy(data_to_sign + offset, received_client_hello, received_client_hello_len);
@@ -155,12 +158,14 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         offset += NONCE_SIZE;
         memcpy(data_to_sign + offset, certificate, cert_size);
         offset += cert_size;
-        memcpy(data_to_sign + offset, server_ephemeral_public_key, server_ephemeral_public_key_len);
-        offset += server_ephemeral_public_key_len;
+        memcpy(data_to_sign + offset, server_ephemeral_public_key, pub_key_size);
+        offset += pub_key_size;
         
         // Sign the data using the server's private key
         uint8_t signature[128]; // Buffer large enough for the signature
         size_t sig_size = sign(signature, data_to_sign, data_size);
+        fprintf(stderr, "Signature size: %zu\n", sig_size);
+        fprintf(stderr, "Signature: %zu\n", signature);
         free(data_to_sign);
         
         // Add handshake signature
@@ -170,10 +175,12 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         
         // Serialize the complete Server Hello TLV into the output buffer
         uint16_t serialized_len = serialize_tlv(buf, serverHello);
+        fprintf(stderr, "Serialized len: %zu\n", serialized_len);
         
         // Debug output: print the Server Hello TLV structure
         fprintf(stderr, "Server Hello TLV structure:\n");
         print_tlv_bytes(buf, serialized_len);
+        fprintf(stderr, "Test %zu\n", signature);
         
         // Free the allocated TLV tree
         free_tlv(serverHello);

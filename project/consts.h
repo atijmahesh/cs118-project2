@@ -209,12 +209,14 @@ static inline void print_tlv_bytes(uint8_t* buffer, uint16_t len) {
         uint8_t type = *buf;
         fprintf(stderr, "Type: 0x%02x\n", type);
         buf += 1;
+        fprintf(stderr, "Fail 1\n");
         if (buf - buffer >= len) {
             print("MALFORMED");
             return;
         }
 
         uint16_t length = 0;
+        fprintf(stderr, "Fail 2\n");
         if (*buf == VN3) {
             buf += 1;
             if (buf - buffer + 1 >= len) {
@@ -232,14 +234,20 @@ static inline void print_tlv_bytes(uint8_t* buffer, uint16_t len) {
             }
         }
         fprintf(stderr, "Length: %hu\n", length);
+        fprintf(stderr, "Fail 3\n");
 
         if (type == CLIENT_HELLO || type == SERVER_HELLO || type == FINISHED ||
             type == CERTIFICATE || type == DATA)
             continue;
         else {
+            fprintf(stderr, "Fail 5\n");
             uint16_t min_length = MIN(len - (buf - buffer), length);
+            fprintf(stderr, "Minlength: %hu\n", min_length);
+            fprintf(stderr, "End\n");
             print_hex(buf, min_length);
+            fprintf(stderr, "Hex Printed\n");
             buf += min_length;
+            fprintf(stderr, "Fail 4\n");
         }
     }
 }
