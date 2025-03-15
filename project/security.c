@@ -104,10 +104,12 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
     }
     else if (server_state == STATE_SERVER_HELLO) {
         tlv* serverHello = create_tlv(SERVER_HELLO);
+        // Add server nonce (TLV type 0x01)
         tlv* nonceTLV = create_tlv(NONCE);
         add_val(nonceTLV, server_nonce, NONCE_SIZE);
         add_tlv(serverHello, nonceTLV);
-
+    
+        // Add certificate (TLV type 0xA0) loaded from file
         tlv* certTLV = deserialize_tlv(certificate, cert_size);
         if (!certTLV) {
             fprintf(stderr, "DEBUG (server): Failed to deserialize certificate TLV\n");
@@ -115,16 +117,18 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
             return 0;
         }
         add_tlv(serverHello, certTLV);
-
+    
+        // Add server ephemeral public key (TLV type 0x02)
         tlv* ephemeralPubTLV = create_tlv(PUBLIC_KEY);
         add_val(ephemeralPubTLV, server_ephemeral_public_key, server_ephemeral_public_key_len);
         add_tlv(serverHello, ephemeralPubTLV);
-
+    
+        // Build handshake transcript: Client Hello + nonce + certificate + ephemeral public key.
         uint8_t transcript[4096];
         size_t offset = 0;
         tlv* clientHelloTlv = deserialize_tlv(received_client_hello, received_client_hello_len);
         if (!clientHelloTlv) {
-            fprintf(stderr, "DEBUG (server): Failed to deserialize cached Client Hello\n");
+            fprintf(stderr, "DEBUG (server): Failed to deserialize cached Client Hello for transcript\n");
             free_tlv(serverHello);
             return 0;
         }
@@ -134,15 +138,18 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         offset += serialize_tlv(transcript + offset, certTLV);
         offset += serialize_tlv(transcript + offset, ephemeralPubTLV);
         fprintf(stderr, "DEBUG (server): Handshake transcript length = %zu\n", offset);
-
+    
+        // Compute handshake signature using server_key.bin private key.
         uint8_t handshake_sig[128];
         size_t handshake_sig_len = sign(handshake_sig, transcript, offset);
         fprintf(stderr, "DEBUG (server): Handshake signature length = %zu\n", handshake_sig_len);
-
+    
+        // Add handshake signature TLV (TLV type 0x21)
         tlv* handshakeSigTLV = create_tlv(HANDSHAKE_SIGNATURE);
         add_val(handshakeSigTLV, handshake_sig, handshake_sig_len);
         add_tlv(serverHello, handshakeSigTLV);
-
+    
+        // Serialize the complete Server Hello TLV.
         uint16_t serialized_len = serialize_tlv(buf, serverHello);
         if (serialized_len <= sizeof(server_hello_msg)) {
             memcpy(server_hello_msg, buf, serialized_len);
@@ -152,7 +159,7 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         }
         fprintf(stderr, "DEBUG (server): Serialized Server Hello:\n");
         print_tlv_bytes(buf, serialized_len);
-
+    
         free_tlv(serverHello);
         server_state = STATE_SERVER_WAIT_FINISHED;
         needs_key_derivation = 1;
