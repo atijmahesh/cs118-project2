@@ -134,7 +134,8 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         // The certificate should already include DNS_NAME, PUBLIC_KEY, and SIGNATURE
         //fprintf(stderr, "Certificate: ");
         //print_tlv_bytes(certificate, cert_size);
-        tlv* certTLV = deserialize_tlv(certificate, cert_size);
+        tlv* certTLV = create_tlv(CERTIFICATE);
+        add_val(certTLV, certificate, cert_size);
 
         if (!certTLV) {
             fprintf(stderr, "Failed to deserialize certificate\n");
@@ -151,19 +152,27 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         // Prepare data for the handshake signature
         size_t data_size = received_client_hello_len + NONCE_SIZE + cert_size + pub_key_size;
         uint8_t* data_to_sign = malloc(data_size);
-        size_t offset = 0;
-        memcpy(data_to_sign + offset, received_client_hello, received_client_hello_len);
-        offset += received_client_hello_len;
-        memcpy(data_to_sign + offset, server_nonce, NONCE_SIZE);
-        offset += NONCE_SIZE;
-        memcpy(data_to_sign + offset, certificate, cert_size);
-        offset += cert_size;
-        memcpy(data_to_sign + offset, server_ephemeral_public_key, pub_key_size);
-        offset += pub_key_size;
+        // size_t offset = 0;
+        // memcpy(data_to_sign + offset, received_client_hello, received_client_hello_len);
+        // offset += received_client_hello_len;
+        // memcpy(data_to_sign + offset, server_nonce, NONCE_SIZE);
+        // offset += NONCE_SIZE;
+        // memcpy(data_to_sign + offset, certificate, cert_size);
+        // offset += cert_size;
+        // memcpy(data_to_sign + offset, server_ephemeral_public_key, pub_key_size);
+        // offset += pub_key_size;
+        fprintf(stderr, "Before offset");
+
+        size_t offset = serialize_tlv(buf, );
+        offset += serialize_tlv(buf+offset, nonceTLV);
+        offset += serialize_tlv(buf+offset, certTLV);
+        offset += serialize_tlv(buf+offset, pubKeyTLV);
+
+        fprintf(stderr, "After offset");
         
         // Sign the data using the server's private key
         uint8_t signature[128]; // Buffer large enough for the signature
-        size_t sig_size = sign(signature, data_to_sign, data_size);
+        size_t sig_size = sign(signature, buf, offset);
         fprintf(stderr, "Signature size: %zu\n", sig_size);
         fprintf(stderr, "Signature: %zu\n", signature);
         free(data_to_sign);
