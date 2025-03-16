@@ -48,6 +48,9 @@ static size_t server_handshake_len = 0;
 
 static int needs_key_derivation = 0;
 
+// Static variable to store the server's ephemeral private key
+static EVP_PKEY* server_ephemeral_private_key = NULL;
+
 void init_sec(int type, char* host) {
     UNUSED(host);
     init_io();
@@ -70,10 +73,9 @@ void init_sec(int type, char* host) {
     } else if (type == SERVER) {
         fprintf(stderr, "DEBUG (server): Starting init_sec\n");
         server_state = STATE_SERVER_WAIT_CLIENT_HELLO;
-        client_state = STATE_ESTABLISHED;  // Prevent server from taking the client branch
+        client_state = STATE_ESTABLISHED;
         load_certificate("server_cert.bin");
-        load_private_key("server_key.bin");
-        fprintf(stderr, "DEBUG (server): Loaded server certificate & private key\n");
+        fprintf(stderr, "DEBUG (server): Loaded server certificate\n");
     }
 }
 
@@ -103,64 +105,77 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         return serialized_len;
     }
     else if (server_state == STATE_SERVER_HELLO) {
-        tlv* serverHello = create_tlv(SERVER_HELLO);
-        // Add server nonce (TLV type 0x01)
+        // Create partial Server-Hello without signature
+        tlv* partialServerHello = create_tlv(SERVER_HELLO);
         tlv* nonceTLV = create_tlv(NONCE);
         add_val(nonceTLV, server_nonce, NONCE_SIZE);
-        add_tlv(serverHello, nonceTLV);
+        add_tlv(partialServerHello, nonceTLV);
     
-        // Add certificate (TLV type 0xA0) loaded from file
         tlv* certTLV = deserialize_tlv(certificate, cert_size);
         if (!certTLV) {
             fprintf(stderr, "DEBUG (server): Failed to deserialize certificate TLV\n");
-            free_tlv(serverHello);
+            free_tlv(partialServerHello);
             return 0;
         }
-        add_tlv(serverHello, certTLV);
+        add_tlv(partialServerHello, certTLV);
     
-        // Add server ephemeral public key (TLV type 0x02)
         tlv* ephemeralPubTLV = create_tlv(PUBLIC_KEY);
         add_val(ephemeralPubTLV, server_ephemeral_public_key, server_ephemeral_public_key_len);
-        add_tlv(serverHello, ephemeralPubTLV);
+        add_tlv(partialServerHello, ephemeralPubTLV);
     
-        // Build handshake transcript: Client Hello + nonce + certificate + ephemeral public key.
+        // Build transcript: Client-Hello TLV + Nonce TLV + Certificate TLV + Public-Key TLV
         uint8_t transcript[4096];
         size_t offset = 0;
-        tlv* clientHelloTlv = deserialize_tlv(received_client_hello, received_client_hello_len);
-        if (!clientHelloTlv) {
-            fprintf(stderr, "DEBUG (server): Failed to deserialize cached Client Hello for transcript\n");
-            free_tlv(serverHello);
-            return 0;
-        }
-        offset += serialize_tlv(transcript + offset, clientHelloTlv);
-        free_tlv(clientHelloTlv);
-        offset += serialize_tlv(transcript + offset, nonceTLV);
-        offset += serialize_tlv(transcript + offset, certTLV);
-        offset += serialize_tlv(transcript + offset, ephemeralPubTLV);
-        fprintf(stderr, "DEBUG (server): Handshake transcript length = %zu\n", offset);
     
-        // Compute handshake signature using server_key.bin private key.
-        uint8_t handshake_sig[128];
-        size_t handshake_sig_len = sign(handshake_sig, transcript, offset);
-        fprintf(stderr, "DEBUG (server): Handshake signature length = %zu\n", handshake_sig_len);
+        // 1. Client-Hello TLV
+        memcpy(transcript, received_client_hello, received_client_hello_len);
+        offset += received_client_hello_len;
+        fprintf(stderr, "DEBUG (server): Added Client-Hello to transcript, length = %zu\n", received_client_hello_len);
     
-        // Add handshake signature TLV (TLV type 0x21)
-        tlv* handshakeSigTLV = create_tlv(HANDSHAKE_SIGNATURE);
-        add_val(handshakeSigTLV, handshake_sig, handshake_sig_len);
-        add_tlv(serverHello, handshakeSigTLV);
+        // 2. Nonce TLV
+        uint8_t nonce_buf[128];
+        uint16_t nonce_len = serialize_tlv(nonce_buf, nonceTLV);
+        memcpy(transcript + offset, nonce_buf, nonce_len);
+        offset += nonce_len;
+        fprintf(stderr, "DEBUG (server): Added Nonce to transcript, length = %u\n", nonce_len);
     
-        // Serialize the complete Server Hello TLV.
-        uint16_t serialized_len = serialize_tlv(buf, serverHello);
-        if (serialized_len <= sizeof(server_hello_msg)) {
-            memcpy(server_hello_msg, buf, serialized_len);
-            server_hello_len = serialized_len;
-        } else {
-            fprintf(stderr, "DEBUG (server): Server Hello too large to cache\n");
-        }
-        fprintf(stderr, "DEBUG (server): Serialized Server Hello:\n");
-        print_tlv_bytes(buf, serialized_len);
+        // 3. Certificate TLV
+        uint8_t cert_buf[1024];
+        uint16_t cert_len = serialize_tlv(cert_buf, certTLV);
+        memcpy(transcript + offset, cert_buf, cert_len);
+        offset += cert_len;
+        fprintf(stderr, "DEBUG (server): Added Certificate to transcript, length = %u\n", cert_len);
     
-        free_tlv(serverHello);
+        // 4. Public-Key TLV (ephemeral)
+        uint8_t pubkey_buf[256];
+        uint16_t pubkey_len = serialize_tlv(pubkey_buf, ephemeralPubTLV);
+        memcpy(transcript + offset, pubkey_buf, pubkey_len);
+        offset += pubkey_len;
+        fprintf(stderr, "DEBUG (server): Added Public-Key to transcript, length = %u\n", pubkey_len);
+    
+        fprintf(stderr, "DEBUG (server): Total transcript length = %zu\n", offset);
+    
+        // Sign the transcript
+        load_private_key("server_key.bin");
+        uint8_t signature[128];
+        size_t sig_len = sign(signature, transcript, offset);
+        fprintf(stderr, "DEBUG (server): Signature length = %zu\n", sig_len);
+    
+        // Restore the ephemeral private key
+        set_private_key(server_ephemeral_private_key);
+    
+        // Add Handshake-Signature TLV
+        tlv* sigTLV = create_tlv(HANDSHAKE_SIGNATURE);
+        add_val(sigTLV, signature, sig_len);
+        add_tlv(partialServerHello, sigTLV);
+    
+        // Serialize full Server-Hello
+        uint16_t serialized_len = serialize_tlv(buf, partialServerHello);
+        fprintf(stderr, "DEBUG (server): Full Server-Hello length = %u\n", serialized_len);
+        memcpy(server_hello_msg, buf, serialized_len);
+        server_hello_len = serialized_len;
+    
+        free_tlv(partialServerHello);
         server_state = STATE_SERVER_WAIT_FINISHED;
         needs_key_derivation = 1;
         return serialized_len;
@@ -176,13 +191,13 @@ void output_sec(uint8_t* buf, size_t length) {
         }
         memcpy(server_handshake_buf + server_handshake_len, buf, length);
         server_handshake_len += length;
-    
+
         tlv* received_tlv = deserialize_tlv(server_handshake_buf, server_handshake_len);
         if (!received_tlv) {
             fprintf(stderr, "DEBUG (server): Incomplete Client Hello, waiting for more data\n");
             return;
         }
-    
+
         uint8_t temp_buf[4096];
         uint16_t complete_len = serialize_tlv(temp_buf, received_tlv);
         if (complete_len != server_handshake_len) {
@@ -191,12 +206,12 @@ void output_sec(uint8_t* buf, size_t length) {
             free_tlv(received_tlv);
             return;
         }
-    
+
         if (received_tlv->type == CLIENT_HELLO) {
             memcpy(received_client_hello, server_handshake_buf, server_handshake_len);
             received_client_hello_len = server_handshake_len;
             server_handshake_len = 0;
-    
+
             tlv* clientNonceTLV = get_tlv(received_tlv, NONCE);
             tlv* clientPubKeyTLV = get_tlv(received_tlv, PUBLIC_KEY);
             if (clientNonceTLV && clientPubKeyTLV) {
@@ -204,13 +219,16 @@ void output_sec(uint8_t* buf, size_t length) {
             } else {
                 fprintf(stderr, "DEBUG (server): Missing TLV fields in Client Hello\n");
             }
-    
+
             generate_nonce(server_nonce, NONCE_SIZE);
-            generate_private_key();
-            derive_public_key();
+
+            // Generate ephemeral key pair
+            generate_private_key(); // Creates ephemeral private key
+            derive_public_key();    // Derives ephemeral public key
             if (public_key && pub_key_size > 0) {
                 server_ephemeral_public_key_len = pub_key_size;
-                memcpy(server_ephemeral_public_key, public_key, server_ephemeral_public_key_len);
+                memcpy(server_ephemeral_public_key, public_key, pub_key_size);
+                server_ephemeral_private_key = get_private_key(); // Save ephemeral private key
                 fprintf(stderr, "DEBUG (server): Generated server ephemeral public key, length = %zu\n", server_ephemeral_public_key_len);
             } else {
                 fprintf(stderr, "DEBUG (server): Failed to generate server ephemeral public key!\n");
@@ -223,8 +241,8 @@ void output_sec(uint8_t* buf, size_t length) {
             free_tlv(received_tlv);
             return;
         }
-    }    
-    
+    }
+
     if (client_state == STATE_CLIENT_WAIT_SERVER_HELLO) {
         if (length <= sizeof(server_hello_msg)) {
             memcpy(server_hello_msg, buf, length);
@@ -246,8 +264,10 @@ void output_sec(uint8_t* buf, size_t length) {
         output_io(buf, length);
         return;
     }
-    
+
     if (needs_key_derivation) {
+        // Set the private key to the ephemeral private key for secret derivation
+        set_private_key(server_ephemeral_private_key);
         derive_secret();
         uint8_t* salt = malloc(received_client_hello_len + server_hello_len);
         if (!salt) {
@@ -260,6 +280,6 @@ void output_sec(uint8_t* buf, size_t length) {
         free(salt);
         needs_key_derivation = 0;
     }
-    
+
     output_io(buf, length);
 }
