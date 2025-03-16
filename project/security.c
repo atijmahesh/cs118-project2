@@ -263,34 +263,156 @@ void output_sec(uint8_t* buf, size_t length) {
 
     // CLIENT FINISHED PHASE
     if (client_state == CLIENT_STATE_FINISHED) {
+        // 1) Cache the raw Server Hello bytes
         if (length <= sizeof(server_hello_msg)) {
             memcpy(server_hello_msg, buf, length);
             server_hello_len = length;
         } else {
             fprintf(stderr, "DEBUG (client): Server Hello too large to cache\n");
-        
-        // Derive secret
+        }
+
+        // 2) Parse the Server Hello TLV
+        tlv* serverHello = deserialize_tlv(buf, (uint16_t)length);
+        if (!serverHello) {
+            fprintf(stderr, "DEBUG (client): Server Hello TLV is invalid!\n");
+            // Handle error or exit
+            return;
+        }
+
+        // --------------------------------------------
+        // 3) Verify the certificate
+        // --------------------------------------------
+        //    3a) Get the certificate TLV (CERTIFICATE).
+        tlv* certTLV = get_tlv(serverHello, CERTIFICATE);
+        if (!certTLV) {
+            fprintf(stderr, "DEBUG (client): Server Hello missing certificate!\n");
+            free_tlv(serverHello);
+            // Possibly exit(1) if required
+            return;
+        }
+
+        //    3b) Load CA’s public key for verifying the certificate
+        load_ca_public_key("ca_public_key.bin");
+
+        // TODO: 
+        //   - Parse the certificate (certTLV->val) to find the DNS name (type 0xA1),
+        //     the signature (type 0xA2), etc.
+        //   - Compare the DNS name with `argv[1]`.
+        //   - verify(...) the certificate signature using ec_ca_public_key.
+        //   - If any check fails, exit with the appropriate status.
+
+        // --------------------------------------------
+        // 4) Verify the server’s handshake signature
+        // --------------------------------------------
+        //    4a) Get ephemeral public key from the Server Hello
+        tlv* ephemeralPubKeyTLV = get_tlv(serverHello, PUBLIC_KEY);
+        if (!ephemeralPubKeyTLV) {
+            fprintf(stderr, "DEBUG (client): Server Hello missing PUBLIC_KEY!\n");
+            free_tlv(serverHello);
+            // Possibly exit(1)
+            return;
+        }
+        //    4b) Load ephemeral key for ECDH
+        load_peer_public_key(ephemeralPubKeyTLV->val, ephemeralPubKeyTLV->length);
+
+        //    4c) Get handshake signature TLV
+        tlv* handshakeSigTLV = get_tlv(serverHello, HANDSHAKE_SIGNATURE);
+        if (!handshakeSigTLV) {
+            fprintf(stderr, "DEBUG (client): No HANDSHAKE_SIGNATURE in Server Hello!\n");
+            free_tlv(serverHello);
+            // Possibly exit(3)
+            return;
+        }
+
+        //    4d) Recreate the transcript you expect the server to have signed.
+        //        This means (Client-Hello + partial Server-Hello data).
+        //        Typically, you'd do something like:
+        //        1) Copy your client_hello_msg into 'transcript'
+        //        2) Re-serialize serverHello WITHOUT the handshake signature TLV
+        //           (you can temporarily remove handshakeSigTLV from serverHello, 
+        //            or make a partial copy).
+        //        3) Call verify(...) with the server’s public key (which must come 
+        //           from the certificate’s public key).
+        //
+        // Example pseudo-code:
+        //
+        // uint8_t transcript[4096];
+        // size_t offset = 0;
+        // memcpy(transcript, client_hello_msg, client_hello_len);
+        // offset += client_hello_len;
+        //
+        // // Remove handshakeSigTLV from serverHello, or create a partial TLV:
+        // //    remove_tlv(serverHello, handshakeSigTLV); // you’d need a custom function
+        // //    or build a clone of serverHello minus that TLV
+        // //    or directly piece together from the known fields.
+        // // Then:
+        // // offset += serialize_tlv(transcript + offset, serverHelloMinusSig);
+        //
+        // int verified = verify(handshakeSigTLV->val, handshakeSigTLV->length,
+        //                       transcript, offset,
+        //                       /*public key from the server certificate (ec_peer_public_key?)*/);
+        // if (verified != 1) {
+        //     fprintf(stderr, "DEBUG (client): Handshake signature verify failed.\n");
+        //     exit(3);
+        // }
+
+        // --------------------------------------------
+        // 5) Now that ephemeral public key is verified, do the ECDH
+        // --------------------------------------------
         derive_secret();
 
-        // Create salt (client_hello + server_hello) and derive keys
+        // --------------------------------------------
+        // 6) Use HKDF to derive ENC and MAC keys
+        // --------------------------------------------
+        //    We do that by combining the client_hello + server_hello as salt
         uint8_t* salt = malloc(client_hello_len + server_hello_len);
         if (!salt) {
-            fprintf(stderr, "DEBUG (client): Salt allocation failed\n");
+            fprintf(stderr, "DEBUG (client): Malloc for salt failed!\n");
+            free_tlv(serverHello);
             return;
         }
         memcpy(salt, client_hello_msg, client_hello_len);
         memcpy(salt + client_hello_len, server_hello_msg, server_hello_len);
         derive_keys(salt, client_hello_len + server_hello_len);
-        free(salt);
 
-        // Transition to DATA phase
+        // --------------------------------------------
+        // 7) Build the FINISHED message
+        // --------------------------------------------
+        //    7a) We want an HMAC of (Client-Hello + Server-Hello)
+        uint8_t transcript_digest[MAC_SIZE]; // 32 bytes if using SHA-256
+        hmac(transcript_digest, salt, client_hello_len + server_hello_len);
+
+        free(salt); // Done using salt
+
+        //    7b) Create the transcript TLV (type TRANSCRIPT)
+        tlv* transcriptTLV = create_tlv(TRANSCRIPT);
+        add_val(transcriptTLV, transcript_digest, MAC_SIZE);
+
+        //    7c) Wrap it in a FINISHED TLV (type FINISHED)
+        tlv* finishedTLV = create_tlv(FINISHED);
+        add_tlv(finishedTLV, transcriptTLV);
+
+        //    7d) Serialize the FINISHED message
+        uint8_t finished_buf[256];
+        uint16_t finished_len = serialize_tlv(finished_buf, finishedTLV);
+
+        // 8) Send the FINISHED message to the server
+        //    Use your existing output layer function
+        output_io(finished_buf, finished_len);
+
+        // Cleanup
+        free_tlv(finishedTLV);
+        free_tlv(serverHello);
+
+        // 9) Transition to DATA phase
         client_state = CLIENT_STATE_DATA;
-        output_io(buf, length);
+
         return;
     }
 
+
     // ---------------------------------------------------------------------
-    // SERVER: VERIFY_HMAC phase (old: STATE_SERVER_WAIT_FINISHED)
+    // SERVER: VERIFY_HMAC phase
     // ---------------------------------------------------------------------
     if (server_state == SERVER_STATE_VERIFY_HMAC && needs_key_derivation) {
         // The server sets its private key to the ephemeral one, derives secrets
