@@ -6,23 +6,23 @@
 #include <string.h>
 #include <unistd.h>
 
-// Handshake states
+// client and server states
 typedef enum {
-    STATE_CLIENT_HELLO,
-    STATE_CLIENT_WAIT_SERVER_HELLO,
-    STATE_ESTABLISHED
+    CLIENT_STATE_HELLO, 
+    CLIENT_STATE_FINISHED,
+    CLIENT_STATE_DATA 
 } client_state_t;
 
 typedef enum {
-    STATE_SERVER_WAIT_CLIENT_HELLO,
-    STATE_SERVER_HELLO,
-    STATE_SERVER_WAIT_FINISHED,
-    STATE_SERVER_ESTABLISHED
+    SERVER_STATE_HELLO,   
+    SERVER_STATE_FINISHED,   
+    SERVER_STATE_VERIFY_HMAC, 
+    SERVER_STATE_DATA    
 } server_state_t;
 
 // Global state variables
-static client_state_t client_state = STATE_CLIENT_HELLO;
-static server_state_t server_state = STATE_SERVER_WAIT_CLIENT_HELLO;
+static client_state_t client_state = CLIENT_STATE_HELLO;
+static server_state_t server_state = SERVER_STATE_HELLO;
 
 // Client handshake buffers
 static uint8_t client_nonce[NONCE_SIZE];
@@ -69,18 +69,26 @@ void init_sec(int type, char* host) {
         generate_nonce(client_nonce, NONCE_SIZE);
         fprintf(stderr, "DEBUG (client): Client nonce, first 4 bytes: %02x %02x %02x %02x\n",
                 client_nonce[0], client_nonce[1], client_nonce[2], client_nonce[3]);
-        client_state = STATE_CLIENT_HELLO;
+
+        // Start in CLIENT_STATE_HELLO
+        client_state = CLIENT_STATE_HELLO;
+
     } else if (type == SERVER) {
         fprintf(stderr, "DEBUG (server): Starting init_sec\n");
-        server_state = STATE_SERVER_WAIT_CLIENT_HELLO;
-        client_state = STATE_ESTABLISHED;
+
+        // Start in SERVER_STATE_HELLO
+        server_state = SERVER_STATE_HELLO;
+        // (Set client side to DATA just to skip any client logic on the server side)
+        client_state = CLIENT_STATE_DATA;
+
         load_certificate("server_cert.bin");
         fprintf(stderr, "DEBUG (server): Loaded server certificate\n");
     }
 }
 
 ssize_t input_sec(uint8_t* buf, size_t max_length) {
-    if (client_state == STATE_CLIENT_HELLO) {
+    // CLIENT HELLO PHASE
+    if (client_state == CLIENT_STATE_HELLO) {
         tlv* clientHello = create_tlv(CLIENT_HELLO);
         tlv* nonceTLV = create_tlv(NONCE);
         add_val(nonceTLV, client_nonce, NONCE_SIZE);
@@ -101,10 +109,13 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         fprintf(stderr, "DEBUG (client): RIGHT BEFORE SENDING:\n");
         print_tlv_bytes(buf, serialized_len);
         free_tlv(clientHello);
-        client_state = STATE_CLIENT_WAIT_SERVER_HELLO;
+
+        // After sending the Hello, move to FINISHED phase
+        client_state = CLIENT_STATE_FINISHED;
         return serialized_len;
     }
-    else if (server_state == STATE_SERVER_HELLO) {
+    // SERVER HELLO PHASE
+    else if (server_state == SERVER_STATE_FINISHED) {
         // Create partial Server-Hello without signature
         tlv* partialServerHello = create_tlv(SERVER_HELLO);
         tlv* nonceTLV = create_tlv(NONCE);
@@ -176,15 +187,19 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         server_hello_len = serialized_len;
     
         free_tlv(partialServerHello);
-        server_state = STATE_SERVER_WAIT_FINISHED;
+
+        // After sending Server Hello, move to VERIFY_HMAC phase
+        server_state = SERVER_STATE_VERIFY_HMAC;
         needs_key_derivation = 1;
         return serialized_len;
     }
+    // FALL THROUGH to normal IO for other states (DATA, etc.)
     return input_io(buf, max_length);
 }
 
 void output_sec(uint8_t* buf, size_t length) {
-    if (server_state == STATE_SERVER_WAIT_CLIENT_HELLO) {
+    // SERVER HELLO phase
+    if (server_state == SERVER_STATE_HELLO) {
         if (server_handshake_len + length > sizeof(server_handshake_buf)) {
             fprintf(stderr, "DEBUG (server): Handshake buffer overflow!\n");
             return;
@@ -229,11 +244,14 @@ void output_sec(uint8_t* buf, size_t length) {
                 server_ephemeral_public_key_len = pub_key_size;
                 memcpy(server_ephemeral_public_key, public_key, pub_key_size);
                 server_ephemeral_private_key = get_private_key(); // Save ephemeral private key
-                fprintf(stderr, "DEBUG (server): Generated server ephemeral public key, length = %zu\n", server_ephemeral_public_key_len);
+                fprintf(stderr, "DEBUG (server): Generated server ephemeral public key, length = %zu\n",
+                        server_ephemeral_public_key_len);
             } else {
                 fprintf(stderr, "DEBUG (server): Failed to generate server ephemeral public key!\n");
             }
-            server_state = STATE_SERVER_HELLO;
+
+            // Move to SERVER_STATE_FINISHED to build/send Server Hello
+            server_state = SERVER_STATE_FINISHED;
             free_tlv(received_tlv);
             return;
         } else {
@@ -243,14 +261,18 @@ void output_sec(uint8_t* buf, size_t length) {
         }
     }
 
-    if (client_state == STATE_CLIENT_WAIT_SERVER_HELLO) {
+    // CLIENT FINISHED PHASE
+    if (client_state == CLIENT_STATE_FINISHED) {
         if (length <= sizeof(server_hello_msg)) {
             memcpy(server_hello_msg, buf, length);
             server_hello_len = length;
         } else {
             fprintf(stderr, "DEBUG (client): Server Hello too large to cache\n");
-        }
+        
+        // Derive secret
         derive_secret();
+
+        // Create salt (client_hello + server_hello) and derive keys
         uint8_t* salt = malloc(client_hello_len + server_hello_len);
         if (!salt) {
             fprintf(stderr, "DEBUG (client): Salt allocation failed\n");
@@ -260,13 +282,18 @@ void output_sec(uint8_t* buf, size_t length) {
         memcpy(salt + client_hello_len, server_hello_msg, server_hello_len);
         derive_keys(salt, client_hello_len + server_hello_len);
         free(salt);
-        client_state = STATE_ESTABLISHED;
+
+        // Transition to DATA phase
+        client_state = CLIENT_STATE_DATA;
         output_io(buf, length);
         return;
     }
 
-    if (needs_key_derivation) {
-        // Set the private key to the ephemeral private key for secret derivation
+    // ---------------------------------------------------------------------
+    // SERVER: VERIFY_HMAC phase (old: STATE_SERVER_WAIT_FINISHED)
+    // ---------------------------------------------------------------------
+    if (server_state == SERVER_STATE_VERIFY_HMAC && needs_key_derivation) {
+        // The server sets its private key to the ephemeral one, derives secrets
         set_private_key(server_ephemeral_private_key);
         derive_secret();
         uint8_t* salt = malloc(received_client_hello_len + server_hello_len);
@@ -278,8 +305,21 @@ void output_sec(uint8_t* buf, size_t length) {
         memcpy(salt + received_client_hello_len, server_hello_msg, server_hello_len);
         derive_keys(salt, received_client_hello_len + server_hello_len);
         free(salt);
+
+        // TODO: Compare received HMAC with generated one (once FINISHED msg is parsed).
+        //       If successful, move to DATA phase.
+
         needs_key_derivation = 0;
+        server_state = SERVER_STATE_DATA; 
+        // or remain in VERIFY_HMAC until the FINISHED message is fully processed
     }
 
+    // CLIENT/SERVER: DATA phase
+    if (client_state == CLIENT_STATE_DATA || server_state == SERVER_STATE_DATA) {
+        // TODO: Implement normal encrypted data handling
+        //       - For receive: decrypt and verify HMAC
+        //       - For send: encrypt, add HMAC
+    }
+    // In all cases, default to existing output_io for sending
     output_io(buf, length);
 }
