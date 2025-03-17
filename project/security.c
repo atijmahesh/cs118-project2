@@ -60,7 +60,7 @@ void init_sec(int type, char* host) {
     g_type = type;
     if (host != NULL) {
         strncpy(g_host, host, sizeof(g_host) - 1);
-        g_host[sizeof(g_host) - 1] = '\0'; 
+        g_host[sizeof(g_host) - 1] = '\0';
     }
 
     if (type == CLIENT) {
@@ -78,6 +78,7 @@ void init_sec(int type, char* host) {
         fprintf(stderr, "DEBUG (client): Client nonce, first 4 bytes: %02x %02x %02x %02x\n",
                 client_nonce[0], client_nonce[1], client_nonce[2], client_nonce[3]);
         client_state = CLIENT_STATE_HELLO;
+        load_ca_public_key("ca_public_key.bin"); // Load CA public key for certificate verification
     } else if (type == SERVER) {
         fprintf(stderr, "DEBUG (server): Starting init_sec\n");
         server_state = SERVER_STATE_HELLO;
@@ -253,28 +254,114 @@ void output_sec(uint8_t* buf, size_t length) {
             server_hello_len = length;
         } else {
             fprintf(stderr, "DEBUG (client): Server Hello too large to cache\n");
-        }
-    
-        // Parse the Server Hello TLV
-        tlv* serverHello = deserialize_tlv(buf, (uint16_t)length);
-        if (!serverHello) {
-            fprintf(stderr, "DEBUG (client): Server Hello TLV is invalid!\n");
             return;
         }
-    
-        // (Optional certificate/handshake verification can be performed here.)
-        /*
+
+        // Parse the Server Hello TLV
+        tlv* serverHello = deserialize_tlv(buf, (uint16_t)length);
+        if (!serverHello || serverHello->type != SERVER_HELLO) {
+            fprintf(stderr, "DEBUG (client): Server Hello TLV is invalid or unexpected type!\n");
+            free_tlv(serverHello);
+            exit(6); // Unexpected message per spec
+        }
+
+        // Extract certificate TLV
         tlv* certTLV = get_tlv(serverHello, CERTIFICATE);
         if (!certTLV) {
             fprintf(stderr, "DEBUG (client): Server Hello missing certificate!\n");
             free_tlv(serverHello);
             return;
         }
-        load_ca_public_key("ca_public_key.bin");
-        // Further checks on DNS name, certificate signature, etc.
-        */
-    
-        // Now build the FINISHED message:
+
+        // Parse certificate TLV
+        tlv* dnsTLV = get_tlv(certTLV, DNS_NAME);
+        tlv* serverPubKeyTLV = get_tlv(certTLV, PUBLIC_KEY);
+        tlv* certSigTLV = get_tlv(certTLV, SIGNATURE);
+        if (!dnsTLV || !serverPubKeyTLV || !certSigTLV) {
+            fprintf(stderr, "DEBUG (client): Certificate missing required fields!\n");
+            free_tlv(serverHello);
+            return;
+        }
+
+        // Verify certificate signature
+        uint8_t cert_data[1024];
+        size_t cert_data_len = 0;
+        uint16_t dns_len = serialize_tlv(cert_data, dnsTLV);
+        cert_data_len += dns_len;
+        uint16_t pubkey_len = serialize_tlv(cert_data + cert_data_len, serverPubKeyTLV);
+        cert_data_len += pubkey_len;
+        int verify_result = verify(certSigTLV->val, certSigTLV->length, cert_data, cert_data_len, ec_ca_public_key);
+        if (verify_result != 1) {
+            fprintf(stderr, "DEBUG (client): Certificate signature verification failed!\n");
+            free_tlv(serverHello);
+            exit(1); // Per spec
+        }
+
+        
+        // Check DNS name
+        char dns_name[256];
+        if (dnsTLV->length >= sizeof(dns_name)) {
+            fprintf(stderr, "DEBUG (client): DNS name too long\n");
+            free_tlv(serverHello);
+            exit(2); // Per spec
+        }
+        memcpy(dns_name, dnsTLV->val, dnsTLV->length);
+        dns_name[dnsTLV->length] = '\0'; // Null-terminate
+
+        if (strcmp(dns_name, g_host) != 0) {
+            fprintf(stderr, "DEBUG (client): DNS name mismatch! Expected '%s', got '%s'\n",
+                    g_host, dns_name);
+            free_tlv(serverHello);
+            exit(2); // Per spec
+        }
+
+        // Get signature TLV from Server Hello
+        tlv* sigTLV = get_tlv(serverHello, HANDSHAKE_SIGNATURE);
+        if (!sigTLV) {
+            fprintf(stderr, "DEBUG (client): Server Hello missing signature!\n");
+            free_tlv(serverHello);
+            return;
+        }
+
+        // Get other TLVs for transcript
+        tlv* serverNonceTLV = get_tlv(serverHello, NONCE);
+        tlv* serverEphemeralPubTLV = get_tlv(serverHello, PUBLIC_KEY);
+        if (!serverNonceTLV || !serverEphemeralPubTLV) {
+            fprintf(stderr, "DEBUG (client): Server Hello missing required fields!\n");
+            free_tlv(serverHello);
+            return;
+        }
+
+        // Build transcript for Server Hello signature verification
+        uint8_t transcript[4096];
+        size_t offset = 0;
+        memcpy(transcript, client_hello_msg, client_hello_len);
+        offset += client_hello_len;
+        uint8_t server_nonce_buf[128];
+        uint16_t server_nonce_len = serialize_tlv(server_nonce_buf, serverNonceTLV);
+        memcpy(transcript + offset, server_nonce_buf, server_nonce_len);
+        offset += server_nonce_len;
+        uint8_t cert_buf[1024];
+        uint16_t cert_len = serialize_tlv(cert_buf, certTLV);
+        memcpy(transcript + offset, cert_buf, cert_len);
+        offset += cert_len;
+        uint8_t server_pubkey_buf[256];
+        uint16_t server_pubkey_len = serialize_tlv(server_pubkey_buf, serverEphemeralPubTLV);
+        memcpy(transcript + offset, server_pubkey_buf, server_pubkey_len);
+        offset += server_pubkey_len;
+
+        // Verify Server Hello signature using server's long-term public key
+        load_peer_public_key(serverPubKeyTLV->val, serverPubKeyTLV->length);
+        verify_result = verify(sigTLV->val, sigTLV->length, transcript, offset, ec_peer_public_key);
+        if (verify_result != 1) {
+            fprintf(stderr, "DEBUG (client): Server Hello signature verification failed!\n");
+            free_tlv(serverHello);
+            exit(3); // Per spec
+        }
+
+        // Derive shared secret and keys using server's ephemeral public key
+        load_peer_public_key(serverEphemeralPubTLV->val, serverEphemeralPubTLV->length);
+        derive_secret();
         uint8_t* salt = malloc(client_hello_len + server_hello_len);
         if (!salt) {
             fprintf(stderr, "DEBUG (client): Malloc for salt failed!\n");
@@ -284,47 +371,76 @@ void output_sec(uint8_t* buf, size_t length) {
         memcpy(salt, client_hello_msg, client_hello_len);
         memcpy(salt + client_hello_len, server_hello_msg, server_hello_len);
         derive_keys(salt, client_hello_len + server_hello_len);
+
+        // Compute transcript HMAC for FINISHED message
         uint8_t transcript_digest[MAC_SIZE];
         hmac(transcript_digest, salt, client_hello_len + server_hello_len);
         free(salt);
-    
+
+        // Build FINISHED message
         tlv* transcriptTLV = create_tlv(TRANSCRIPT);
         add_val(transcriptTLV, transcript_digest, MAC_SIZE);
-    
         tlv* finishedTLV = create_tlv(FINISHED);
         add_tlv(finishedTLV, transcriptTLV);
-    
         uint8_t finished_buf[256];
         uint16_t finished_len = serialize_tlv(finished_buf, finishedTLV);
-    
-        // PRIORITIZE SENDING the FINISHED message:
+
+        // Send FINISHED message
         output_io(finished_buf, finished_len);
         fprintf(stderr, "DEBUG (client): Sent FINISHED message, length = %u\n", finished_len);
-    
+
         free_tlv(finishedTLV);
         free_tlv(serverHello);
-    
+
         client_state = CLIENT_STATE_DATA;
         return;
     }
     
     // SERVER: VERIFY_HMAC phase
-    if (g_type == SERVER && server_state == SERVER_STATE_VERIFY_HMAC && needs_key_derivation) {
+    if (g_type == SERVER && server_state == SERVER_STATE_VERIFY_HMAC) {
+        tlv* finishedTLV = deserialize_tlv(buf, length);
+        if (!finishedTLV || finishedTLV->type != FINISHED) {
+            fprintf(stderr, "DEBUG (server): Expected FINISHED message, got type %02x\n",
+                    finishedTLV ? finishedTLV->type : 0);
+            free_tlv(finishedTLV);
+            exit(6); // Unexpected message per spec
+        }
+        tlv* transcriptTLV = get_tlv(finishedTLV, TRANSCRIPT);
+        if (!transcriptTLV || transcriptTLV->length != MAC_SIZE) {
+            fprintf(stderr, "DEBUG (server): Invalid TRANSCRIPT in FINISHED message\n");
+            free_tlv(finishedTLV);
+            exit(4); // Per spec
+        }
+
+        // Derive keys
         set_private_key(server_ephemeral_private_key);
         derive_secret();
         uint8_t* salt = malloc(received_client_hello_len + server_hello_len);
         if (!salt) {
             fprintf(stderr, "DEBUG (server): Salt allocation failed\n");
+            free_tlv(finishedTLV);
             return;
         }
         memcpy(salt, received_client_hello, received_client_hello_len);
         memcpy(salt + received_client_hello_len, server_hello_msg, server_hello_len);
         derive_keys(salt, received_client_hello_len + server_hello_len);
+
+        // Compute expected HMAC
+        uint8_t expected_digest[MAC_SIZE];
+        hmac(expected_digest, salt, received_client_hello_len + server_hello_len);
         free(salt);
-    
-        // TODO: Compare received HMAC with generated one (once FINISHED msg is parsed)
+
+        // Compare with received transcript
+        if (memcmp(transcriptTLV->val, expected_digest, MAC_SIZE) != 0) {
+            fprintf(stderr, "DEBUG (server): HMAC verification failed\n");
+            free_tlv(finishedTLV);
+            exit(4); // Per spec
+        }
+
+        free_tlv(finishedTLV);
         needs_key_derivation = 0;
         server_state = SERVER_STATE_DATA;
+        fprintf(stderr, "DEBUG (server): HMAC verified, transitioning to DATA state\n");
         return;
     }
     
