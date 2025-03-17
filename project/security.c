@@ -24,7 +24,7 @@ typedef enum {
 static client_state_t client_state = CLIENT_STATE_HELLO;
 static server_state_t server_state = SERVER_STATE_HELLO;
 static char g_host[256] = {0};
-static int g_type = -1; // -1: uninitialized, 0: CLIENT, 1: SERVER
+static int g_type = -1; // -1 uninitialized, 0 CLIENT, 1 SERVER
 
 // Client handshake buffers
 static uint8_t client_nonce[NONCE_SIZE];
@@ -65,21 +65,17 @@ void init_sec(int type, char* host) {
     }
 
     if (type == CLIENT) {
-        fprintf(stderr, "DEBUG (client): Starting init_sec\n");
         generate_private_key();
         derive_public_key();
         if (public_key && pub_key_size > 0) {
             client_public_key_len = pub_key_size;
             memcpy(client_public_key, public_key, client_public_key_len);
-            fprintf(stderr, "DEBUG (client): Client ephemeral public key, length = %zu\n", client_public_key_len);
         } else {
             fprintf(stderr, "DEBUG (client): Failed to generate client ephemeral public key!\n");
         }
         generate_nonce(client_nonce, NONCE_SIZE);
-        fprintf(stderr, "DEBUG (client): Client nonce, first 4 bytes: %02x %02x %02x %02x\n",
-                client_nonce[0], client_nonce[1], client_nonce[2], client_nonce[3]);
         client_state = CLIENT_STATE_HELLO;
-        load_ca_public_key("ca_public_key.bin"); // Load CA public key for certificate verification
+        load_ca_public_key("ca_public_key.bin");
     }
     else if (type == SERVER) {
         fprintf(stderr, "DEBUG (server): Starting init_sec\n");
@@ -122,21 +118,20 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
             finished_len = 0; // Reset after sending
             handshake_complete = 1;
             client_state = CLIENT_STATE_DATA;
-            fprintf(stderr, "DEBUG (client): Sent FINISHED message, length = %zu\n", len);
             return len;
         } else if (client_state == CLIENT_STATE_DATA && handshake_complete) {
             // Send encrypted data
-            if (max_length < 74) { // 58 (TLV overhead) + 16 (min ciphertext)
+            if (max_length < 74) { // 58 TLV overhead + 16 min ciphertext
                 return 0;
             }
 
             size_t max_ciphertext_size = ((max_length - 58) / 16) * 16;
             size_t max_plaintext_size = max_ciphertext_size - 1;
 
-            uint8_t plaintext[943]; // Max per spec
+            uint8_t plaintext[943];
             ssize_t read_len = read(STDIN_FILENO, plaintext, max_plaintext_size);
             if (read_len <= 0) {
-                return 0; // No data or error
+                return 0; // No data/error
             }
             size_t plaintext_size = (size_t)read_len;
 
@@ -246,7 +241,6 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
             generate_nonce(iv, 16);
             uint8_t cipher[960];
             size_t cipher_size = encrypt_data(iv, cipher, buf, plaintext_size);
-            fprintf(stderr, "DEBUG (server): Encrypted %zu bytes to %zu bytes\n", plaintext_size, cipher_size);
         
             // Build DATA TLV
             tlv* ivTLV = create_tlv(IV);
@@ -270,7 +264,6 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
             add_tlv(dataTLV, cipherTLV);
             add_tlv(dataTLV, macTLV);
             size_t data_len = serialize_tlv(buf, dataTLV);
-            fprintf(stderr, "DEBUG (server): Sending encrypted DATA TLV, length = %zu\n", data_len);
             free_tlv(dataTLV);
             return data_len;
         }
@@ -369,7 +362,6 @@ void output_sec(uint8_t* buf, size_t length) {
             free_tlv(finishedTLV);
             needs_key_derivation = 0;
             server_state = SERVER_STATE_DATA;
-            fprintf(stderr, "DEBUG (server): HMAC verified, transitioning to DATA state\n");
             return;
         } else if (server_state == SERVER_STATE_DATA) {
             // Receive and decrypt encrypted data from the client
@@ -412,8 +404,6 @@ void output_sec(uint8_t* buf, size_t length) {
             size_t plaintext_size = decrypt_cipher(plaintext, cipherTLV->val, cipherTLV->length, ivTLV->val);
 
             write(STDOUT_FILENO, plaintext, plaintext_size);
-            fprintf(stderr, "DEBUG (server): Decrypted and wrote %zu bytes to stdout\n", plaintext_size);
-
             free_tlv(dataTLV);
             return;
         }
@@ -541,14 +531,13 @@ void output_sec(uint8_t* buf, size_t length) {
             free_tlv(finishedTLV);
             free_tlv(serverHello);
 
-            fprintf(stderr, "DEBUG (client): Prepared FINISHED message, length = %zu\n", finished_len);
-            return; // FINISHED will be sent in input_sec
+            return; // FINISHED sent in input_sec
         } else if (client_state == CLIENT_STATE_DATA && handshake_complete) {
             // Receive and decrypt encrypted data from the server
             tlv* dataTLV = deserialize_tlv(buf, length);
             if (!dataTLV || dataTLV->type != DATA) {
                 fprintf(stderr, "DEBUG (client): Expected DATA TLV, got %02x\n", dataTLV ? dataTLV->type : 0);
-                output_io(buf, length); // Fall back to unencrypted data
+                output_io(buf, length); // Fall back
                 free_tlv(dataTLV);
                 return;
             }
@@ -589,6 +578,5 @@ void output_sec(uint8_t* buf, size_t length) {
             return;
         }
     }
-    // Default case: handle unencrypted data
     output_io(buf, length);
 }
