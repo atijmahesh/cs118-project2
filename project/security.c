@@ -233,88 +233,48 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
             server_state = SERVER_STATE_VERIFY_HMAC;
             needs_key_derivation = 1;
             return serialized_len;
-        } else if (server_state == SERVER_STATE_DATA) {
-            static int first_data_send = 1;
-            if (first_data_send) {
-                // Send test message on first data send
-                first_data_send = 0;
-                const char* test_message = "Hello from server";
-                size_t plaintext_size = strlen(test_message);
-                if (plaintext_size > max_length - 58) { // Account for TLV overhead
-                    plaintext_size = max_length - 58;
-                }
-                uint8_t iv[16];
-                generate_nonce(iv, 16);
-                uint8_t cipher[960];
-                size_t cipher_size = encrypt_data(iv, cipher, (uint8_t*)test_message, plaintext_size);
-                fprintf(stderr, "DEBUG (server): Encrypted %zu bytes to %zu bytes\n", plaintext_size, cipher_size);
-
-                // Build DATA TLV
-                tlv* ivTLV = create_tlv(IV);
-                add_val(ivTLV, iv, 16);
-                tlv* cipherTLV = create_tlv(CIPHERTEXT);
-                add_val(cipherTLV, cipher, cipher_size);
-                uint8_t iv_buf[18];
-                uint16_t iv_len = serialize_tlv(iv_buf, ivTLV);
-                uint8_t cipher_buf[963];
-                uint16_t cipher_len = serialize_tlv(cipher_buf, cipherTLV);
-                uint8_t hmac_input[981];
-                memcpy(hmac_input, iv_buf, iv_len);
-                memcpy(hmac_input + iv_len, cipher_buf, cipher_len);
-                size_t hmac_input_size = iv_len + cipher_len;
-                uint8_t mac[32];
-                hmac(mac, hmac_input, hmac_input_size);
-                tlv* macTLV = create_tlv(MAC);
-                add_val(macTLV, mac, 32);
-                tlv* dataTLV = create_tlv(DATA);
-                add_tlv(dataTLV, ivTLV);
-                add_tlv(dataTLV, cipherTLV);
-                add_tlv(dataTLV, macTLV);
-                size_t data_len = serialize_tlv(buf, dataTLV);
-                fprintf(stderr, "DEBUG (server): Sending encrypted DATA TLV, length = %zu\n", data_len);
-                free_tlv(dataTLV);
-                return data_len;
-            } else {
-                // Read from stdin and encrypt subsequent data
-                ssize_t read_len = input_io(buf, max_length);
-                if (read_len <= 0) {
-                    fprintf(stderr, "DEBUG (server): No data read from stdin\n");
-                    return 0;
-                }
-                size_t plaintext_size = (size_t)read_len;
-                uint8_t iv[16];
-                generate_nonce(iv, 16);
-                uint8_t cipher[960];
-                size_t cipher_size = encrypt_data(iv, cipher, buf, plaintext_size);
-                fprintf(stderr, "DEBUG (server): Encrypted %zu bytes to %zu bytes\n", plaintext_size, cipher_size);
-
-                // Build DATA TLV
-                tlv* ivTLV = create_tlv(IV);
-                add_val(ivTLV, iv, 16);
-                tlv* cipherTLV = create_tlv(CIPHERTEXT);
-                add_val(cipherTLV, cipher, cipher_size);
-                uint8_t iv_buf[18];
-                uint16_t iv_len = serialize_tlv(iv_buf, ivTLV);
-                uint8_t cipher_buf[963];
-                uint16_t cipher_len = serialize_tlv(cipher_buf, cipherTLV);
-                uint8_t hmac_input[981];
-                memcpy(hmac_input, iv_buf, iv_len);
-                memcpy(hmac_input + iv_len, cipher_buf, cipher_len);
-                size_t hmac_input_size = iv_len + cipher_len;
-                uint8_t mac[32];
-                hmac(mac, hmac_input, hmac_input_size);
-                tlv* macTLV = create_tlv(MAC);
-                add_val(macTLV, mac, 32);
-                tlv* dataTLV = create_tlv(DATA);
-                add_tlv(dataTLV, ivTLV);
-                add_tlv(dataTLV, cipherTLV);
-                add_tlv(dataTLV, macTLV);
-                size_t data_len = serialize_tlv(buf, dataTLV);
-                fprintf(stderr, "DEBUG (server): Sending encrypted DATA TLV, length = %zu\n", data_len);
-                free_tlv(dataTLV);
-                return data_len;
+        }
+        else if (server_state == SERVER_STATE_DATA) {
+            // Read from stdin and encrypt data
+            ssize_t read_len = input_io(buf, max_length);
+            if (read_len <= 0) {
+                fprintf(stderr, "DEBUG (server): No data read from stdin\n");
+                return 0;
             }
-        } else {
+            size_t plaintext_size = (size_t)read_len;
+            uint8_t iv[16];
+            generate_nonce(iv, 16);
+            uint8_t cipher[960];
+            size_t cipher_size = encrypt_data(iv, cipher, buf, plaintext_size);
+            fprintf(stderr, "DEBUG (server): Encrypted %zu bytes to %zu bytes\n", plaintext_size, cipher_size);
+        
+            // Build DATA TLV
+            tlv* ivTLV = create_tlv(IV);
+            add_val(ivTLV, iv, 16);
+            tlv* cipherTLV = create_tlv(CIPHERTEXT);
+            add_val(cipherTLV, cipher, cipher_size);
+            uint8_t iv_buf[18];
+            uint16_t iv_len = serialize_tlv(iv_buf, ivTLV);
+            uint8_t cipher_buf[963];
+            uint16_t cipher_len = serialize_tlv(cipher_buf, cipherTLV);
+            uint8_t hmac_input[981];
+            memcpy(hmac_input, iv_buf, iv_len);
+            memcpy(hmac_input + iv_len, cipher_buf, cipher_len);
+            size_t hmac_input_size = iv_len + cipher_len;
+            uint8_t mac[32];
+            hmac(mac, hmac_input, hmac_input_size);
+            tlv* macTLV = create_tlv(MAC);
+            add_val(macTLV, mac, 32);
+            tlv* dataTLV = create_tlv(DATA);
+            add_tlv(dataTLV, ivTLV);
+            add_tlv(dataTLV, cipherTLV);
+            add_tlv(dataTLV, macTLV);
+            size_t data_len = serialize_tlv(buf, dataTLV);
+            fprintf(stderr, "DEBUG (server): Sending encrypted DATA TLV, length = %zu\n", data_len);
+            free_tlv(dataTLV);
+            return data_len;
+        }
+        else {
             return 0;
         }
     }
