@@ -124,12 +124,57 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
             fprintf(stderr, "DEBUG (client): Sent FINISHED message, length = %zu\n", len);
             return len;
         } else if (client_state == CLIENT_STATE_DATA && handshake_complete) {
-            // Send application data
-            ssize_t len = read(STDIN_FILENO, buf, max_length);
-            if (len > 0) {
-                return len;
+            // Send encrypted data
+            if (max_length < 74) { // 58 (TLV overhead) + 16 (min ciphertext)
+                return 0;
             }
-            return 0;
+
+            size_t max_ciphertext_size = ((max_length - 58) / 16) * 16;
+            size_t max_plaintext_size = max_ciphertext_size - 1;
+
+            uint8_t plaintext[943]; // Max per spec
+            ssize_t read_len = read(STDIN_FILENO, plaintext, max_plaintext_size);
+            if (read_len <= 0) {
+                return 0; // No data or error
+            }
+            size_t plaintext_size = (size_t)read_len;
+
+            uint8_t iv[16];
+            generate_nonce(iv, 16);
+
+            uint8_t cipher[960]; // Max ciphertext size (943 + padding)
+            size_t cipher_size = encrypt_data(iv, cipher, plaintext, plaintext_size);
+
+            tlv* ivTLV = create_tlv(IV);
+            add_val(ivTLV, iv, 16);
+
+            tlv* cipherTLV = create_tlv(CIPHERTEXT);
+            add_val(cipherTLV, cipher, cipher_size);
+
+            uint8_t iv_buf[18];
+            uint16_t iv_len = serialize_tlv(iv_buf, ivTLV);
+            uint8_t cipher_buf[963]; // Max cipher_size + header
+            uint16_t cipher_len = serialize_tlv(cipher_buf, cipherTLV);
+            uint8_t hmac_input[981]; // 18 + 963
+            memcpy(hmac_input, iv_buf, iv_len);
+            memcpy(hmac_input + iv_len, cipher_buf, cipher_len);
+            size_t hmac_input_size = iv_len + cipher_len;
+
+            uint8_t mac[32];
+            hmac(mac, hmac_input, hmac_input_size);
+
+            tlv* macTLV = create_tlv(MAC);
+            add_val(macTLV, mac, 32);
+
+            tlv* dataTLV = create_tlv(DATA);
+            add_tlv(dataTLV, ivTLV);
+            add_tlv(dataTLV, cipherTLV);
+            add_tlv(dataTLV, macTLV);
+
+            size_t data_len = serialize_tlv(buf, dataTLV);
+            free_tlv(dataTLV);
+
+            return data_len;
         }
     } else if (g_type == SERVER && server_state == SERVER_STATE_FINISHED) {
         // Send Server Hello
@@ -182,6 +227,58 @@ ssize_t input_sec(uint8_t* buf, size_t max_length) {
         server_state = SERVER_STATE_VERIFY_HMAC;
         needs_key_derivation = 1;
         return serialized_len;
+    } else if (g_type == SERVER && server_state == SERVER_STATE_DATA) {
+        // Send encrypted data
+        if (max_length < 74) { // 58 (TLV overhead) + 16 (min ciphertext)
+            return 0;
+        }
+
+        size_t max_ciphertext_size = ((max_length - 58) / 16) * 16;
+        size_t max_plaintext_size = max_ciphertext_size - 1;
+
+        uint8_t plaintext[943]; // Max per spec
+        ssize_t read_len = read(STDIN_FILENO, plaintext, max_plaintext_size);
+        if (read_len <= 0) {
+            return 0; // No data or error
+        }
+        size_t plaintext_size = (size_t)read_len;
+
+        uint8_t iv[16];
+        generate_nonce(iv, 16);
+
+        uint8_t cipher[960]; // Max ciphertext size (943 + padding)
+        size_t cipher_size = encrypt_data(iv, cipher, plaintext, plaintext_size);
+
+        tlv* ivTLV = create_tlv(IV);
+        add_val(ivTLV, iv, 16);
+
+        tlv* cipherTLV = create_tlv(CIPHERTEXT);
+        add_val(cipherTLV, cipher, cipher_size);
+
+        uint8_t iv_buf[18];
+        uint16_t iv_len = serialize_tlv(iv_buf, ivTLV);
+        uint8_t cipher_buf[963]; // Max cipher_size + header
+        uint16_t cipher_len = serialize_tlv(cipher_buf, cipherTLV);
+        uint8_t hmac_input[981]; // 18 + 963
+        memcpy(hmac_input, iv_buf, iv_len);
+        memcpy(hmac_input + iv_len, cipher_buf, cipher_len);
+        size_t hmac_input_size = iv_len + cipher_len;
+
+        uint8_t mac[32];
+        hmac(mac, hmac_input, hmac_input_size);
+
+        tlv* macTLV = create_tlv(MAC);
+        add_val(macTLV, mac, 32);
+
+        tlv* dataTLV = create_tlv(DATA);
+        add_tlv(dataTLV, ivTLV);
+        add_tlv(dataTLV, cipherTLV);
+        add_tlv(dataTLV, macTLV);
+
+        size_t data_len = serialize_tlv(buf, dataTLV);
+        free_tlv(dataTLV);
+
+        return data_len;
     }
     return input_io(buf, max_length);
 }
@@ -399,6 +496,94 @@ void output_sec(uint8_t* buf, size_t length) {
         needs_key_derivation = 0;
         server_state = SERVER_STATE_DATA;
         fprintf(stderr, "DEBUG (server): HMAC verified, transitioning to DATA state\n");
+        return;
+    } else if (g_type == CLIENT && client_state == CLIENT_STATE_DATA && handshake_complete) {
+        // Receive and decrypt data
+        tlv* dataTLV = deserialize_tlv(buf, length);
+        if (!dataTLV || dataTLV->type != DATA) {
+            fprintf(stderr, "DEBUG (client): Expected DATA TLV, got %02x\n", dataTLV ? dataTLV->type : 0);
+            output_io(buf, length); // Fall back to unencrypted data
+            free_tlv(dataTLV);
+            return;
+        }
+
+        tlv* ivTLV = get_tlv(dataTLV, IV);
+        tlv* cipherTLV = get_tlv(dataTLV, CIPHERTEXT);
+        tlv* macTLV = get_tlv(dataTLV, MAC);
+        if (!ivTLV || ivTLV->length != 16 || !cipherTLV || !macTLV || macTLV->length != 32) {
+            fprintf(stderr, "DEBUG (client): Missing or invalid TLVs in DATA\n");
+            free_tlv(dataTLV);
+            exit(5);
+        }
+
+        uint8_t iv_buf[18];
+        uint16_t iv_len = serialize_tlv(iv_buf, ivTLV);
+        uint8_t cipher_buf[963];
+        uint16_t cipher_len = serialize_tlv(cipher_buf, cipherTLV);
+        uint8_t hmac_input[981];
+        memcpy(hmac_input, iv_buf, iv_len);
+        memcpy(hmac_input + iv_len, cipher_buf, cipher_len);
+        size_t hmac_input_size = iv_len + cipher_len;
+
+        uint8_t computed_mac[32];
+        hmac(computed_mac, hmac_input, hmac_input_size);
+
+        if (memcmp(macTLV->val, computed_mac, 32) != 0) {
+            fprintf(stderr, "DEBUG (client): HMAC verification failed\n");
+            free_tlv(dataTLV);
+            exit(5);
+        }
+
+        uint8_t plaintext[960];
+        size_t plaintext_size = decrypt_cipher(plaintext, cipherTLV->val, cipherTLV->length, ivTLV->val);
+
+        write(STDOUT_FILENO, plaintext, plaintext_size);
+
+        free_tlv(dataTLV);
+        return;
+    } else if (g_type == SERVER && server_state == SERVER_STATE_DATA) {
+        // Receive and decrypt data
+        tlv* dataTLV = deserialize_tlv(buf, length);
+        if (!dataTLV || dataTLV->type != DATA) {
+            fprintf(stderr, "DEBUG (server): Expected DATA TLV, got %02x\n", dataTLV ? dataTLV->type : 0);
+            output_io(buf, length); // Fall back to unencrypted data
+            free_tlv(dataTLV);
+            return;
+        }
+
+        tlv* ivTLV = get_tlv(dataTLV, IV);
+        tlv* cipherTLV = get_tlv(dataTLV, CIPHERTEXT);
+        tlv* macTLV = get_tlv(dataTLV, MAC);
+        if (!ivTLV || ivTLV->length != 16 || !cipherTLV || !macTLV || macTLV->length != 32) {
+            fprintf(stderr, "DEBUG (server): Missing or invalid TLVs in DATA\n");
+            free_tlv(dataTLV);
+            exit(5);
+        }
+
+        uint8_t iv_buf[18];
+        uint16_t iv_len = serialize_tlv(iv_buf, ivTLV);
+        uint8_t cipher_buf[963];
+        uint16_t cipher_len = serialize_tlv(cipher_buf, cipherTLV);
+        uint8_t hmac_input[981];
+        memcpy(hmac_input, iv_buf, iv_len);
+        memcpy(hmac_input + iv_len, cipher_buf, cipher_len);
+        size_t hmac_input_size = iv_len + cipher_len;
+
+        uint8_t computed_mac[32];
+        hmac(computed_mac, hmac_input, hmac_input_size);
+
+        if (memcmp(macTLV->val, computed_mac, 32) != 0) {
+            fprintf(stderr, "DEBUG (server): HMAC verification failed\n");
+            free_tlv(dataTLV);
+            exit(5);
+        }
+
+        uint8_t plaintext[960];
+        size_t plaintext_size = decrypt_cipher(plaintext, cipherTLV->val, cipherTLV->length, ivTLV->val);
+
+        write(STDOUT_FILENO, plaintext, plaintext_size);
+
+        free_tlv(dataTLV);
         return;
     }
 
